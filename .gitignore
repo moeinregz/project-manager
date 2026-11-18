@@ -1,0 +1,6 @@
+projects.db
+projects.db-*
+*.db.dl
+__pycache__/
+.vercel
+.env
