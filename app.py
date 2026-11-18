@@ -122,8 +122,42 @@ def _find_blob_token():
     return ""
 
 
-BLOB_TOKEN = _find_blob_token()
-BLOB_STORE_ID = (BLOB_TOKEN.split("_") + ["", "", "", ""])[3]  # vercel_blob_rw_<storeId>_<secret>
+# Two ways Vercel connects a Blob store to a project:
+#  - a read-write token (BLOB_READ_WRITE_TOKEN = vercel_blob_rw_<storeId>_<secret>), or
+#  - newer: BLOB_STORE_ID + Vercel's OIDC token, which arrives with every request
+#    in the x-vercel-oidc-token header (or VERCEL_OIDC_TOKEN).
+BLOB_RW_TOKEN = _find_blob_token()
+
+
+def _norm_store(sid):
+    sid = (sid or "").strip()
+    return sid[len("store_"):] if sid.startswith("store_") else sid
+
+
+BLOB_STORE_ID = _norm_store((BLOB_RW_TOKEN.split("_") + ["", "", "", ""])[3]) if BLOB_RW_TOKEN \
+    else _norm_store(os.environ.get("BLOB_STORE_ID", ""))
+_req_oidc = ""  # OIDC token of the request being handled
+
+
+def _oidc_token():
+    if _req_oidc:
+        return _req_oidc
+    t = os.environ.get("VERCEL_OIDC_TOKEN", "").strip()
+    if t:
+        return t
+    f = os.environ.get("VERCEL_OIDC_TOKEN_FILE", "")
+    if f and os.path.exists(f):
+        with open(f) as fh:
+            return fh.read().strip()
+    return ""
+
+
+def blob_token():
+    return BLOB_RW_TOKEN or (_oidc_token() if BLOB_STORE_ID else "")
+
+
+def blob_ready():
+    return bool(ON_VERCEL and blob_token())
 BLOB_API = os.environ.get("PM_BLOB_API", "https://blob.vercel-storage.com")  # override only for tests
 BLOB_API_VERSION = "13"  # same as @vercel/blob 2.x
 BLOB_PREFIX = "project-manager/"
@@ -143,7 +177,7 @@ class BlobHTTPError(RuntimeError):
 
 
 def _blob_headers(extra=None):
-    h = {"authorization": "Bearer " + BLOB_TOKEN, "x-api-version": BLOB_API_VERSION}
+    h = {"authorization": "Bearer " + blob_token(), "x-api-version": BLOB_API_VERSION}
     if BLOB_STORE_ID:
         h["x-vercel-blob-store-id"] = BLOB_STORE_ID
     h.update(extra or {})
@@ -168,7 +202,7 @@ def _blob(method, query="", body=None, headers=None, path="/"):
 
 def _blob_download(url):
     # Private stores need the token to read; public ones simply ignore it.
-    req = urllib.request.Request(url, headers={"authorization": "Bearer " + BLOB_TOKEN})
+    req = urllib.request.Request(url, headers={"authorization": "Bearer " + blob_token()})
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             return r.read()
@@ -211,7 +245,7 @@ def _blob_upload(data):
 def blob_pull():
     """Bring /tmp/projects.db up to date with the latest saved copy."""
     global _blob_url
-    if not (ON_VERCEL and BLOB_TOKEN):
+    if not blob_ready():
         return False
     blobs = _blob_list()
     if not blobs:
@@ -232,7 +266,7 @@ def blob_pull():
 def blob_push():
     """Save /tmp/projects.db as a new copy and remove the older ones."""
     global _blob_url
-    if not (ON_VERCEL and BLOB_TOKEN):
+    if not blob_ready():
         return
     with open(DB_PATH, "rb") as f:
         data = f.read()
@@ -244,7 +278,7 @@ def blob_push():
 
 
 def db():
-    if ON_VERCEL and not BLOB_TOKEN:
+    if ON_VERCEL and not blob_token():
         raise RuntimeError("روی Vercel باید Blob رو وصل کنی: Storage → Create → Blob → Connect (راهنما: README).")
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -493,7 +527,9 @@ def _secret():
     """Random per-install secret kept in the database (survives restarts)."""
     if ON_VERCEL:
         # Derived from the private Blob token, so logging in never has to save the database.
-        return hashlib.sha256(("pm-session|" + BLOB_TOKEN).encode()).hexdigest()
+        # Stable across instances: the read-write token if there is one, else the
+        # password itself (it's in the signing key anyway) plus the store id.
+        return hashlib.sha256(("pm-session|" + (BLOB_RW_TOKEN or password() + "|" + BLOB_STORE_ID)).encode()).hexdigest()
     with _db_lock, db() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         r = conn.execute("SELECT value FROM settings WHERE key='secret'").fetchone()
@@ -582,16 +618,23 @@ def setup_error_page(err):
     esc = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     checks = [
         ("رمز ورود (PM_PASSWORD)", len(password()) >= 8, "توی Settings → Environment Variables متغیر PM_PASSWORD رو بذار (حداقل ۸ کاراکتر)."),
-        ("اتصال Blob (BLOB_READ_WRITE_TOKEN)", bool(BLOB_TOKEN), "توی تب Storage یه Blob بساز و Connect کن به همین پروژه."),
+        ("اتصال Blob", bool(blob_token()), "توی تب Storage یه Blob بساز و Connect کن به همین پروژه."),
     ]
+    blob_vars = sorted(k for k in os.environ if "BLOB" in k.upper() or "OIDC" in k.upper())
+    seen = ("متغیرهای مربوط که برنامه می‌بینه: " + "، ".join(blob_vars)) if blob_vars else "برنامه هیچ متغیری مربوط به Blob نمی‌بینه."
+    seen += " | توکن OIDC درخواست: " + ("هست" if _req_oidc else "نیست")
     rows = "".join(
         f"<li><b>{'✔' if ok else '✘'}</b> {name}{'' if ok else '<br><small>' + fix + '</small>'}</li>" for name, ok, fix in checks)
     if isinstance(err, BlobHTTPError):
-        if err.code in (401, 403):
+        if "OIDC is enabled" in str(err.detail):
+            hint = "Blob به این محیط (Production/Preview) وصل نیست. توی Storage ← Blob ← Projects، اتصال رو با تیک همه‌ی محیط‌ها دوباره بزن و Redeploy کن."
+        elif err.code in (401, 403):
             hint = "توکن Blob قبول نشد. Blob رو یه بار Disconnect و دوباره Connect کن، بعد Redeploy."
         else:
             hint = "Vercel Blob جواب نداد یا خطا داد. چند دقیقه بعد صفحه رو رفرش کن."
-    elif not BLOB_TOKEN:
+    elif isinstance(err, BlobHTTPError) is False and BLOB_STORE_ID and not blob_token():
+        hint = "Store به پروژه وصله ولی توکن OIDC نرسید. توی Settings → Security، گزینه‌ی Secure Backend Access with OIDC Federation رو روشن کن و Redeploy بزن."
+    elif not blob_token():
         hint = "بعد از Connect کردن Blob، حتماً از تب Deployments یه Redeploy بزن. متغیرهای جدید فقط تو Deploy بعدی اعمال می‌شن."
     else:
         hint = ""
@@ -603,12 +646,13 @@ def setup_error_page(err):
 h1{{margin:0 0 6px;font-size:20px}} ul{{list-style:none;padding:0;margin:14px 0}} li{{margin:8px 0}} small{{color:#8c8c8a}}
 .h{{border-right:3px solid #8b5cf6;padding-right:10px;margin:12px 0}} code{{display:block;direction:ltr;text-align:left;background:#0a0a0a;border:1px solid #2f2f2f;border-radius:10px;padding:10px;font-size:12px;color:#8c8c8a;white-space:pre-wrap;word-break:break-all}}</style>
 </head><body><div class="c"><h1>برنامه هنوز کامل وصل نشده</h1>
-<ul>{rows}</ul>{f'<p class="h">{hint}</p>' if hint else ''}
+<ul>{rows}</ul>{f'<p class="h">{hint}</p>' if hint else ''}<p><small>{seen}</small></p>
 <p><small>متن خطا (برای عیب‌یابی):</small></p><code>{esc(repr(err))[:600]}</code></div></body></html>"""
 
 
 def application(environ, start_response):
-    global _init_done
+    global _init_done, _req_oidc
+    _req_oidc = environ.get("HTTP_X_VERCEL_OIDC_TOKEN", "").strip()
     if not _init_done:
         try:
             with _sync_lock:
