@@ -109,9 +109,26 @@ _db_lock = threading.Lock()
 # runs — it's just projects.db next to app.py.
 
 ON_VERCEL = bool(os.environ.get("VERCEL"))
-BLOB_TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
+
+
+def _find_blob_token():
+    """BLOB_READ_WRITE_TOKEN, or the same token under a custom prefix (e.g. MYSTORE_READ_WRITE_TOKEN)."""
+    t = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
+    if t:
+        return t
+    for k, v in sorted(os.environ.items()):
+        if k.endswith("_READ_WRITE_TOKEN") and v.strip().startswith("vercel_blob_rw_"):
+            return v.strip()
+    return ""
+
+
+BLOB_TOKEN = _find_blob_token()
+BLOB_STORE_ID = (BLOB_TOKEN.split("_") + ["", "", "", ""])[3]  # vercel_blob_rw_<storeId>_<secret>
 BLOB_API = os.environ.get("PM_BLOB_API", "https://blob.vercel-storage.com")  # override only for tests
+BLOB_API_VERSION = "13"  # same as @vercel/blob 2.x
 BLOB_PREFIX = "project-manager/"
+# A store is created "private" (recommended) or "public"; uploads must say which.
+_blob_access = os.environ.get("PM_BLOB_ACCESS", "").strip().lower() or None
 _blob_url = None  # the copy currently in /tmp
 _sync_lock = threading.Lock()
 
@@ -119,14 +136,44 @@ if ON_VERCEL:
     DB_PATH = os.path.join(tempfile.gettempdir(), "projects.db")
 
 
+class BlobHTTPError(RuntimeError):
+    def __init__(self, code, detail):
+        super().__init__(f"Vercel Blob HTTP {code}: {detail}")
+        self.code, self.detail = code, detail
+
+
+def _blob_headers(extra=None):
+    h = {"authorization": "Bearer " + BLOB_TOKEN, "x-api-version": BLOB_API_VERSION}
+    if BLOB_STORE_ID:
+        h["x-vercel-blob-store-id"] = BLOB_STORE_ID
+    h.update(extra or {})
+    return h
+
+
 def _blob(method, query="", body=None, headers=None, path="/"):
     req = urllib.request.Request(BLOB_API + path + (("?" + query) if query else ""), data=body, method=method,
-                                 headers={"authorization": "Bearer " + BLOB_TOKEN, "x-api-version": "9", **(headers or {})})
+                                 headers=_blob_headers(headers))
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Vercel Blob HTTP {e.code}: {e.read()[:300]!r}")
+        raw = e.read()[:400]
+        try:
+            j = json.loads(raw)
+            detail = (j.get("error") or {}).get("message") or (j.get("error") or {}).get("code") or raw.decode("utf-8", "replace")
+        except Exception:
+            detail = raw.decode("utf-8", "replace")
+        raise BlobHTTPError(e.code, detail)
+
+
+def _blob_download(url):
+    # Private stores need the token to read; public ones simply ignore it.
+    req = urllib.request.Request(url, headers={"authorization": "Bearer " + BLOB_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise BlobHTTPError(e.code, "download failed")
 
 
 def _blob_list():
@@ -142,6 +189,25 @@ def _blob_list():
             return sorted(out, key=lambda b: b.get("uploadedAt", ""))
 
 
+def _blob_upload(data):
+    """Upload a new copy; works out whether the store is private or public."""
+    global _blob_access
+    tries = [_blob_access] if _blob_access else ["private", "public"]
+    last = None
+    for access in tries:
+        try:
+            r = _blob("PUT", urlencode({"pathname": BLOB_PREFIX + "projects.db"}), data,
+                      {"x-vercel-blob-access": access, "x-add-random-suffix": "1",
+                       "x-content-type": "application/octet-stream"})
+            _blob_access = access
+            return r
+        except BlobHTTPError as e:
+            last = e
+            if e.code not in (400, 403, 409, 422):  # only an access mismatch is worth retrying
+                raise
+    raise last
+
+
 def blob_pull():
     """Bring /tmp/projects.db up to date with the latest saved copy."""
     global _blob_url
@@ -154,8 +220,7 @@ def blob_pull():
     if latest == _blob_url and os.path.exists(DB_PATH):
         return False
     if True:
-        with urllib.request.urlopen(latest, timeout=25) as r:
-            data = r.read()
+        data = _blob_download(latest)
         tmp = DB_PATH + ".dl"
         with open(tmp, "wb") as f:
             f.write(data)
@@ -171,8 +236,7 @@ def blob_push():
         return
     with open(DB_PATH, "rb") as f:
         data = f.read()
-    r = _blob("PUT", urlencode({"pathname": BLOB_PREFIX + "projects.db"}), data,
-              {"x-add-random-suffix": "1", "x-content-type": "application/octet-stream"})
+    r = _blob_upload(data)
     _blob_url = r["url"]
     old = [b["url"] for b in _blob_list() if b["url"] != _blob_url]
     if old:
@@ -513,6 +577,36 @@ STATUS = {200: "200 OK", 302: "302 Found", 400: "400 Bad Request", 401: "401 Una
 _init_done = False
 
 
+def setup_error_page(err):
+    """Plain page that says what's missing on Vercel, with the real error underneath."""
+    esc = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    checks = [
+        ("رمز ورود (PM_PASSWORD)", len(password()) >= 8, "توی Settings → Environment Variables متغیر PM_PASSWORD رو بذار (حداقل ۸ کاراکتر)."),
+        ("اتصال Blob (BLOB_READ_WRITE_TOKEN)", bool(BLOB_TOKEN), "توی تب Storage یه Blob بساز و Connect کن به همین پروژه."),
+    ]
+    rows = "".join(
+        f"<li><b>{'✔' if ok else '✘'}</b> {name}{'' if ok else '<br><small>' + fix + '</small>'}</li>" for name, ok, fix in checks)
+    if isinstance(err, BlobHTTPError):
+        if err.code in (401, 403):
+            hint = "توکن Blob قبول نشد. Blob رو یه بار Disconnect و دوباره Connect کن، بعد Redeploy."
+        else:
+            hint = "Vercel Blob جواب نداد یا خطا داد. چند دقیقه بعد صفحه رو رفرش کن."
+    elif not BLOB_TOKEN:
+        hint = "بعد از Connect کردن Blob، حتماً از تب Deployments یه Redeploy بزن. متغیرهای جدید فقط تو Deploy بعدی اعمال می‌شن."
+    else:
+        hint = ""
+    return f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>تنظیمات ناقصه</title>
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0a0a;color:#f4f4f3;font-family:Vazirmatn,Tahoma,sans-serif;padding:16px}}
+.c{{width:min(560px,100%);background:#121212;border:1px solid #2f2f2f;border-radius:18px;padding:24px;line-height:1.9}}
+h1{{margin:0 0 6px;font-size:20px}} ul{{list-style:none;padding:0;margin:14px 0}} li{{margin:8px 0}} small{{color:#8c8c8a}}
+.h{{border-right:3px solid #8b5cf6;padding-right:10px;margin:12px 0}} code{{display:block;direction:ltr;text-align:left;background:#0a0a0a;border:1px solid #2f2f2f;border-radius:10px;padding:10px;font-size:12px;color:#8c8c8a;white-space:pre-wrap;word-break:break-all}}</style>
+</head><body><div class="c"><h1>برنامه هنوز کامل وصل نشده</h1>
+<ul>{rows}</ul>{f'<p class="h">{hint}</p>' if hint else ''}
+<p><small>متن خطا (برای عیب‌یابی):</small></p><code>{esc(repr(err))[:600]}</code></div></body></html>"""
+
+
 def application(environ, start_response):
     global _init_done
     if not _init_done:
@@ -523,9 +617,10 @@ def application(environ, start_response):
             _init_done = True
         except Exception as e:  # noqa
             print("خطای دیتابیس:", repr(e), file=sys.stderr)
-            msg = str(e) if isinstance(e, RuntimeError) and "Blob HTTP" not in str(e) else "به Vercel Blob وصل نشد. توی Storage چک کن Blob به این پروژه وصل باشه."
-            body = f"<h3 dir=rtl style='font-family:Tahoma;padding:24px'>{msg}</h3>".encode("utf-8")
-            start_response("500 Internal Server Error", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
+            body = setup_error_page(e).encode("utf-8")
+            start_response("500 Internal Server Error", [("Content-Type", "text/html; charset=utf-8"),
+                                                         ("Content-Length", str(len(body))), ("Cache-Control", "no-store"),
+                                                         ("X-Robots-Tag", "noindex, nofollow")])
             return [body]
 
     method = environ.get("REQUEST_METHOD", "GET").upper()
@@ -557,8 +652,7 @@ def application(environ, start_response):
 
         # ---- login gate ------------------------------------------------
         if ON_VERCEL and len(password()) < 8:
-            return respond(500, "<h3 dir=rtl style='font-family:Tahoma;padding:24px'>رمز ورود تنظیم نشده: توی Vercel متغیر PM_PASSWORD رو بذار (حداقل ۸ کاراکتر) و دوباره Deploy کن.</h3>",
-                           "text/html; charset=utf-8")
+            return respond(500, setup_error_page(RuntimeError("PM_PASSWORD is not set")), "text/html; charset=utf-8")
         if password():
             cookies = SimpleCookie(environ.get("HTTP_COOKIE", ""))
             token = cookies[SESSION_COOKIE].value if SESSION_COOKIE in cookies else ""
@@ -603,6 +697,9 @@ def application(environ, start_response):
         return handle_app(method, path, environ, respond, read_body)
     except BadRequest as e:
         return respond(400, {"ok": False, "message": str(e)})
+    except BlobHTTPError as e:
+        print("خطای Blob:", repr(e), file=sys.stderr)
+        return respond(500, {"ok": False, "message": f"ذخیره روی Vercel Blob نشد ({e.code}): {e.detail}"[:300]})
     except Exception as e:  # noqa
         print("خطا:", repr(e), file=sys.stderr)
         return respond(500, {"ok": False, "message": "یه مشکلی پیش اومد، دوباره امتحان کن."})
