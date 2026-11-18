@@ -650,6 +650,19 @@ h1{{margin:0 0 6px;font-size:20px}} ul{{list-style:none;padding:0;margin:14px 0}
 <p><small>متن خطا (برای عیب‌یابی):</small></p><code>{esc(repr(err))[:600]}</code></div></body></html>"""
 
 
+def request_path(environ):
+    """The path the browser asked for. On Vercel every request is rewritten to
+    /api/index (see vercel.json), which passes the original path as ?__path=."""
+    q = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    if "__path" in q:
+        p = q["__path"][0] or "/"
+        return p if p.startswith("/") else "/" + p
+    p = environ.get("PATH_INFO") or "/"
+    if p.rstrip("/") in ("/api/index", "/api/index.py"):
+        return "/"
+    return p
+
+
 def application(environ, start_response):
     global _init_done, _req_oidc
     _req_oidc = environ.get("HTTP_X_VERCEL_OIDC_TOKEN", "").strip()
@@ -668,7 +681,7 @@ def application(environ, start_response):
             return [body]
 
     method = environ.get("REQUEST_METHOD", "GET").upper()
-    path = environ.get("PATH_INFO") or "/"
+    path = request_path(environ)
     https = environ.get("wsgi.url_scheme") == "https" or environ.get("HTTP_X_FORWARDED_PROTO", "").startswith("https")
     ip = (environ.get("HTTP_X_FORWARDED_FOR") or environ.get("REMOTE_ADDR") or "").split(",")[0].strip()
 
